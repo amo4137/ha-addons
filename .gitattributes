@@ -1,0 +1,2 @@
+# The add-on runs on Linux: a CRLF run.sh would not start.
+* text=auto eol=lf
