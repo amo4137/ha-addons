@@ -1,7 +1,7 @@
 name: "Smart Wardrobe AI"
-version: "0.3.0"
+version: "0.4.0"
 slug: "smart_wardrobe_ai"
-description: "Analyse les photos de vêtements de Smart Wardrobe avec Gemini ou Claude ; garde la clé d'API hors de l'application"
+description: "Analyse les photos de vêtements de Smart Wardrobe avec Gemini ; garde la clé d'API hors de l'application"
 arch:
   - aarch64
   - amd64
@@ -16,12 +16,9 @@ ports_description:
   8095/tcp: "API de l'application (HTTPS si ssl est activé)"
 
 options:
-  provider: gemini
   gemini_api_key: ""
   gemini_model: "gemini-3.8-flash"
-  anthropic_api_key: ""
   app_token: ""
-  model: "claude-opus-5-5"
   effort: "low"
   daily_limit: 200
   ssl: false
@@ -29,12 +26,9 @@ options:
   keyfile: privkey.pem
 
 schema:
-  provider: list(gemini|claude)
   gemini_api_key: password?
   gemini_model: list(gemini-3.8-flash|gemini-3.5-flash-lite|gemini-3.1-flash-lite)
-  anthropic_api_key: password?
   app_token: password
-  model: list(claude-fable-5-1|claude-opus-5-5|claude-sonnet-5-5|claude-haiku-4-5)
   effort: list(low|medium|high)
   daily_limit: int(1,5000)
   ssl: bool

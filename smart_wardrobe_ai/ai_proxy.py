@@ -3,7 +3,7 @@
 Runs as a Home Assistant add-on on the local network. It keeps the
 provider's API key, checks the app's token, enforces a daily quota, and
 turns one photo into structured clothing attributes with Gemini (free tier,
-ADR-034) or Claude. Photos are never written to disk and nothing personal
+ADR-034). Photos are never written to disk and nothing personal
 is logged.
 """
 
@@ -24,18 +24,12 @@ from email.parser import BytesParser
 from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import anthropic
-
 import analysis
 
 MAX_BODY_BYTES = 8_000_000
 MAX_IMAGE_BYTES = 5_000_000
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 IDEMPOTENCY_SECONDS = 3600
-
-# Server-side fallback on a refusal (opt-in beta); Haiku does not take it.
-_FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5",
-                    "claude-fable-5-1"}
 
 log = logging.getLogger("ai_proxy")
 
@@ -47,89 +41,6 @@ class ProviderError(Exception):
         self.status = status
         self.retryable = retryable
         self.retry_after = retry_after
-
-
-class Analyzer:
-    """One Claude call per photo; every attribute at once (docs/08 §5)."""
-
-    def __init__(self, client, model, effort):
-        self.client = client
-        self.model = model
-        self.effort = effort
-
-    def analyze(self, request, image, media_type):
-        output_config = {
-            "format": {"type": "json_schema",
-                       "schema": analysis.build_schema(request)},
-        }
-        if not self.model.startswith("claude-haiku"):
-            output_config["effort"] = self.effort
-        extra = {}
-        if self.model in _FALLBACK_MODELS:
-            extra = {
-                "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
-                "extra_body": {"fallbacks": "default"},
-            }
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=8000,
-                system=[{"type": "text", "text": analysis.SYSTEM_PROMPT,
-                         "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": [
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": media_type,
-                        "data": base64.standard_b64encode(image).decode("ascii")}},
-                    {"type": "text", "text": analysis.build_user_text(request)},
-                ]}],
-                output_config=output_config,
-                **extra,
-            )
-        except anthropic.RateLimitError as error:
-            raise ProviderError("provider_unavailable", "Provider rate limit.", 503,
-                                True, _retry_after(error)) from error
-        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as error:
-            log.error("The Anthropic API key is refused: check the add-on options")
-            raise ProviderError("provider_unavailable", "Provider refused the key.",
-                                502, False) from error
-        except anthropic.APITimeoutError as error:
-            raise ProviderError("timeout", "Provider timeout.", 504, True) from error
-        except anthropic.APIConnectionError as error:
-            raise ProviderError("provider_unavailable", "Provider unreachable.",
-                                502, True) from error
-        except anthropic.APIStatusError as error:
-            retryable = error.status_code >= 500
-            log.warning("Provider error %s (request %s)", error.status_code,
-                        getattr(error, "request_id", None))
-            raise ProviderError("provider_unavailable", "Provider error.", 502,
-                                retryable) from error
-
-        if response.stop_reason == "refusal":
-            raise ProviderError("unsupported", "The photo was not analysed.", 422, False)
-        if response.stop_reason == "max_tokens":
-            raise ProviderError("provider_unavailable", "Incomplete analysis.", 502, True)
-        text = next((block.text for block in response.content if block.type == "text"), None)
-        try:
-            result = analysis.normalize(analysis.parse_model_text(text or ""), request)
-        except ValueError as error:
-            raise ProviderError("provider_unavailable", "Unreadable analysis.", 502,
-                                True) from error
-        result["model"] = response.model
-        result["promptVersion"] = analysis.PROMPT_VERSION
-        usage = response.usage
-        result["usage"] = {
-            "inputTokens": usage.input_tokens,
-            "outputTokens": usage.output_tokens,
-            "cacheReadTokens": getattr(usage, "cache_read_input_tokens", None) or 0,
-        }
-        return result
-
-
-def _retry_after(error):
-    try:
-        return int(error.response.headers.get("retry-after", "60"))
-    except (AttributeError, TypeError, ValueError):
-        return 60
 
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
@@ -155,9 +66,9 @@ def _gemini_post(url, key, body, timeout=60.0):
 
 
 class GeminiAnalyzer:
-    """Same contract as [Analyzer], with the Gemini API (ADR-034): one
-    generateContent call per photo, JSON constrained by the same schema.
-    Plain HTTP with the standard library, so no new dependency."""
+    """One generateContent call per photo with the Gemini API (ADR-034), JSON
+    constrained by a schema (docs/08 §5). Plain HTTP with the standard
+    library, so no dependency."""
 
     def __init__(self, key, model, effort, post=_gemini_post):
         self.key = key
@@ -544,18 +455,12 @@ def load_options(path="/data/options.json"):
 
 
 def build_analyzer(options):
-    """The provider chosen in the add-on options (ADR-034)."""
-    effort = options.get("effort", "low")
-    if options.get("provider", "gemini") == "gemini":
-        if not options.get("gemini_api_key"):
-            log.error("Set gemini_api_key in the add-on options")
-        return GeminiAnalyzer(options.get("gemini_api_key", ""),
-                              options.get("gemini_model", "gemini-3.8-flash"), effort)
-    if not options.get("anthropic_api_key"):
-        log.error("Set anthropic_api_key in the add-on options")
-    client = anthropic.Anthropic(api_key=options.get("anthropic_api_key") or None,
-                                 timeout=60.0, max_retries=2)
-    return Analyzer(client, options.get("model", "claude-opus-5-5"), effort)
+    """The Gemini analyzer described by the add-on options (ADR-034)."""
+    if not options.get("gemini_api_key"):
+        log.error("Set gemini_api_key in the add-on options")
+    return GeminiAnalyzer(options.get("gemini_api_key", ""),
+                          options.get("gemini_model", "gemini-3.8-flash"),
+                          options.get("effort", "low"))
 
 
 def main():

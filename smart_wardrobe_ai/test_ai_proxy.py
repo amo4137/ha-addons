@@ -1,4 +1,4 @@
-"""Tests of the proxy, with fake Claude and Gemini clients: no network, no cost."""
+"""Tests of the proxy, with a fake Gemini API: no network, no cost."""
 
 import datetime
 import json
@@ -8,14 +8,11 @@ import ssl
 import subprocess
 import tempfile
 import threading
-import types
 import unittest
 import urllib.error
 import urllib.request
 import uuid
 from http.server import ThreadingHTTPServer
-
-import anthropic
 
 import ai_proxy
 import analysis
@@ -57,32 +54,6 @@ def good_answer(**overrides):
     return answer
 
 
-class FakeMessages:
-    def __init__(self, answer=None, stop_reason="end_turn", error=None):
-        self.answer = good_answer() if answer is None else answer
-        self.stop_reason = stop_reason
-        self.error = error
-        self.calls = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        if self.error is not None:
-            raise self.error
-        text = self.answer if isinstance(self.answer, str) else json.dumps(self.answer)
-        return types.SimpleNamespace(
-            stop_reason=self.stop_reason,
-            model=kwargs["model"],
-            content=[types.SimpleNamespace(type="thinking", thinking=""),
-                     types.SimpleNamespace(type="text", text=text)],
-            usage=types.SimpleNamespace(input_tokens=2100, output_tokens=380,
-                                        cache_read_input_tokens=900),
-        )
-
-
-def fake_client(**kwargs):
-    return types.SimpleNamespace(messages=FakeMessages(**kwargs))
-
-
 class AnalysisTest(unittest.TestCase):
     def test_rejects_invalid_requests(self):
         for payload in [
@@ -121,76 +92,6 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(result["fields"], {})
         self.assertFalse(result["isClothing"])
         self.assertEqual(result["warnings"], ["Aucun vêtement visible."])
-
-
-class AnalyzerTest(unittest.TestCase):
-    def setUp(self):
-        self.request = analysis.parse_request(request_payload())
-
-    def test_sends_the_photo_schema_and_fallback(self):
-        client = fake_client()
-        result = ai_proxy.Analyzer(client, "claude-opus-5-5", "low").analyze(
-            self.request, b"jpeg-bytes", "image/jpeg")
-
-        call = client.messages.calls[0]
-        self.assertEqual(call["model"], "claude-opus-5-5")
-        self.assertEqual(call["output_config"]["effort"], "low")
-        self.assertEqual(call["output_config"]["format"]["type"], "json_schema")
-        self.assertEqual(call["extra_body"], {"fallbacks": "default"})
-        image = call["messages"][0]["content"][0]
-        self.assertEqual(image["source"]["media_type"], "image/jpeg")
-        self.assertNotIn("thinking", call)
-        self.assertEqual(result["fields"]["name"]["value"], "Chemise en lin bleue")
-        self.assertEqual(result["usage"]["inputTokens"], 2100)
-        self.assertEqual(result["promptVersion"], analysis.PROMPT_VERSION)
-
-    def test_haiku_gets_neither_effort_nor_fallback(self):
-        client = fake_client()
-        ai_proxy.Analyzer(client, "claude-haiku-4-5", "low").analyze(
-            self.request, b"x", "image/jpeg")
-        call = client.messages.calls[0]
-        self.assertNotIn("effort", call["output_config"])
-        self.assertNotIn("extra_body", call)
-
-    def test_every_model_offered_by_the_add_on_gets_valid_parameters(self):
-        with open(os.path.join(os.path.dirname(__file__), "config.yaml"),
-                  encoding="utf-8") as file:
-            line = next(l for l in file if l.strip().startswith("model: list("))
-        models = line.split("list(", 1)[1].rstrip().rstrip(")").split("|")
-        self.assertIn("claude-opus-5-5", models)
-        for model in models:
-            client = fake_client()
-            ai_proxy.Analyzer(client, model, "low").analyze(
-                self.request, b"x", "image/jpeg")
-            call = client.messages.calls[0]
-            haiku = model.startswith("claude-haiku")
-            self.assertEqual("effort" in call["output_config"], not haiku, model)
-            self.assertEqual("extra_body" in call, not haiku, model)
-            self.assertNotIn("thinking", call)
-
-    def test_refusal_and_truncation_are_errors(self):
-        for stop, status in [("refusal", 422), ("max_tokens", 502)]:
-            client = fake_client(stop_reason=stop)
-            with self.assertRaises(ai_proxy.ProviderError) as caught:
-                ai_proxy.Analyzer(client, "claude-opus-5-5", "low").analyze(
-                    self.request, b"x", "image/jpeg")
-            self.assertEqual(caught.exception.status, status)
-
-    def test_unreadable_output_is_retryable(self):
-        client = fake_client(answer="not json")
-        with self.assertRaises(ai_proxy.ProviderError) as caught:
-            ai_proxy.Analyzer(client, "claude-opus-5-5", "low").analyze(
-                self.request, b"x", "image/jpeg")
-        self.assertTrue(caught.exception.retryable)
-
-    def test_connection_failure_is_retryable(self):
-        error = anthropic.APIConnectionError(request=None)
-        client = fake_client(error=error)
-        with self.assertRaises(ai_proxy.ProviderError) as caught:
-            ai_proxy.Analyzer(client, "claude-opus-5-5", "low").analyze(
-                self.request, b"x", "image/jpeg")
-        self.assertTrue(caught.exception.retryable)
-        self.assertEqual(caught.exception.status, 502)
 
 
 class FakeGemini:
@@ -296,14 +197,14 @@ class GeminiAnalyzerTest(unittest.TestCase):
             self.analyze(fake, model)
             self.assertTrue(fake.calls[0][0].endswith(f"/{model}:generateContent"))
 
-    def test_options_choose_the_provider(self):
-        gemini = ai_proxy.build_analyzer({"gemini_api_key": "k"})
-        self.assertIsInstance(gemini, ai_proxy.GeminiAnalyzer)
-        self.assertEqual(gemini.model, "gemini-3.8-flash")
-        claude = ai_proxy.build_analyzer({"provider": "claude", "anthropic_api_key": "k",
-                                          "model": "claude-haiku-4-5"})
-        self.assertIsInstance(claude, ai_proxy.Analyzer)
-        self.assertEqual(claude.model, "claude-haiku-4-5")
+    def test_options_build_the_analyzer(self):
+        analyzer = ai_proxy.build_analyzer({"gemini_api_key": "k"})
+        self.assertIsInstance(analyzer, ai_proxy.GeminiAnalyzer)
+        self.assertEqual((analyzer.model, analyzer.effort), ("gemini-3.8-flash", "low"))
+        chosen = ai_proxy.build_analyzer({"gemini_api_key": "k",
+                                          "gemini_model": "gemini-3.5-flash-lite",
+                                          "effort": "high"})
+        self.assertEqual((chosen.model, chosen.effort), ("gemini-3.5-flash-lite", "high"))
 
 
 class QuotaAndIdempotencyTest(unittest.TestCase):
@@ -331,9 +232,10 @@ class QuotaAndIdempotencyTest(unittest.TestCase):
 
 class HttpTest(unittest.TestCase):
     def setUp(self):
-        self.client = fake_client()
+        self.gemini = FakeGemini()
         self.proxy = ai_proxy.Proxy(
-            ai_proxy.Analyzer(self.client, "claude-opus-5-5", "low"),
+            ai_proxy.GeminiAnalyzer("gemini-key", "gemini-3.8-flash", "low",
+                                    post=self.gemini),
             "secret-token",
             ai_proxy.DailyQuota(2),
         )
@@ -372,8 +274,8 @@ class HttpTest(unittest.TestCase):
         self.assertIsNone(body["error"])
         self.assertEqual(body["data"]["fields"]["category"]["value"], "shirt")
         self.assertIn("requestId", body["meta"])
-        sent = self.client.messages.calls[0]["messages"][0]["content"][0]
-        self.assertEqual(sent["source"]["data"], "/9hqcGVn")  # the image bytes
+        sent = self.gemini.calls[0][2]["contents"][0]["parts"][0]["inlineData"]
+        self.assertEqual(sent["data"], "/9hqcGVn")  # the image bytes
 
     def test_repeated_wrong_tokens_block_the_address(self):
         self.proxy.throttle = ai_proxy.AuthThrottle(limit=3)
@@ -382,19 +284,19 @@ class HttpTest(unittest.TestCase):
         status, body = self.post()  # Even the right token waits now.
         self.assertEqual(status, 429)
         self.assertEqual(body["error"]["retryAfterSeconds"], 600)
-        self.assertEqual(self.client.messages.calls, [])
+        self.assertEqual(self.gemini.calls, [])
 
-    def test_wrong_token_is_refused_without_calling_claude(self):
+    def test_wrong_token_is_refused_without_calling_gemini(self):
         status, body = self.post(token="nope")
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")
-        self.assertEqual(self.client.messages.calls, [])
+        self.assertEqual(self.gemini.calls, [])
 
     def test_a_retry_with_the_same_key_is_not_billed_twice(self):
         self.post(key="fingerprint-1")
         status, _ = self.post(key="fingerprint-1")
         self.assertEqual(status, 200)
-        self.assertEqual(len(self.client.messages.calls), 1)
+        self.assertEqual(len(self.gemini.calls), 1)
 
     def test_quota_answers_429_with_retry_after(self):
         self.post()
@@ -415,7 +317,7 @@ class HttpTest(unittest.TestCase):
                                          headers={"Authorization": "Bearer secret-token"})
         with urllib.request.urlopen(request) as response:
             body = json.loads(response.read())
-        self.assertEqual(body["data"]["model"], "claude-opus-5-5")
+        self.assertEqual(body["data"]["model"], "gemini-3.8-flash")
         self.assertEqual(body["data"]["remainingToday"], 2)
 
 
@@ -443,7 +345,8 @@ class TlsTest(unittest.TestCase):
         self.key = os.path.join(self.directory, "privkey.pem")
         self.make_certificate("first.test")
         proxy = ai_proxy.Proxy(
-            ai_proxy.Analyzer(fake_client(), "claude-opus-5-5", "low"),
+            ai_proxy.GeminiAnalyzer("gemini-key", "gemini-3.8-flash", "low",
+                                    post=FakeGemini()),
             "secret-token", ai_proxy.DailyQuota(5))
         self.server = ai_proxy.TlsServer(("127.0.0.1", 0), ai_proxy.make_handler(proxy),
                                          self.cert, self.key)
