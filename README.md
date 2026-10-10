@@ -21,5 +21,6 @@ sont proposées comme celles des add-ons officiels.
 
 ## Add-ons
 
-- [Smart Wardrobe AI](smart_wardrobe_ai/README.md) : analyse les photos de
-  vêtements de l'application Smart Wardrobe avec Gemini ou Claude.
+Aucun pour l'instant. L'add-on Smart Wardrobe AI a été retiré le 2026-10-10 : l'application
+Smart Wardrobe appelle désormais Gemini directement avec la clé de l'utilisateur.
+Son code reste dans l'historique git de ce dépôt.
